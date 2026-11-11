@@ -1,0 +1,30 @@
+SECTION 2.2 HOMEWORK REPORT
+==========================
+Name:
+Program SHA-256 (from grade.py --json):
+
+1. Register allocation
+List r1..r7 and explain which values each contains at each phase.
+
+2. Bit-level correctness
+Explain reversal, population count, independent sequence wrap, tag masking,
+and why your checksum rotation is correct for all uint32 values.
+
+3. Streaming invariant
+Explain why each input creates exactly two ordered outputs, why the checksum
+survives FIFO stalls, and why the next PULL is eventually reached.
+
+4. Performance and memory
+Record instruction count, 96 + 8*L bytes, retired cycles/input, and final score.
+Describe one optimization, with before/after measurements from the same judge.
+Explain the tradeoff between unrolling, loops, and mask-based algorithms.
+
+5. C connection
+Give a portable uint32_t expression for rotate-left by five and for extracting
+bits 15..8. Explain why shifting a 32-bit C value by 32 is not acceptable.
+
+6. Boundary example
+Trace input 0xFFFFFFFF, including both outputs when previous checksum is zero.
+
+The report is a required explanation artifact but carries no subjective points.
+The numeric score is exclusively the published judge result.

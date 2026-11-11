@@ -1,0 +1,17 @@
+; 背景：PIO 是 CPU 之外的小型狀態機，自己跑一小段程式（最多 32 條指令）。
+; 它沒有記憶體，只有：
+;   X、Y  兩個暫存器
+;   OSR   CPU 送來的資料放這裡，用 out 取出
+;   ISR   要送回 CPU 的資料放這裡，用 in 放入、用 push 送出
+;
+; CPU → TX FIFO → OSR → (out) → X → (in) → ISR → (push) → RX FIFO → CPU
+;
+; 這支程式把 CPU 送來的每個 word 原樣送回去。
+; （假設 OSR 已設定為 autopull：OSR 空了會自動從 TX FIFO 補下一個 word。）
+
+.program echo
+.wrap_target
+    out x, 32       ; 從 OSR 取 32 個 bit 放進 X
+    in  x, 32       ; 把 X 放進 ISR
+    push            ; 送回 CPU
+.wrap               ; 回到 .wrap_target，重複執行

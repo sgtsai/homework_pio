@@ -1,0 +1,687 @@
+SECTION 2.2 TUTORIAL: BITS, C OPERATORS, RISC-V, AND PIO
+=====================================================
+
+Purpose
+-------
+This tutorial explains the background needed to read demo_asm.c and
+demo_pio.pio. It also summarizes the fundamentals of the two resources linked
+from this folder's README.md. It is preparation material, not an exam solution
+or a claim about what the exam will contain.
+
+The examples require basic familiarity with C variables and functions. No
+development board is needed. The C demo runs on a normal computer; the PIO
+demo is a reading exercise. The assembly examples below are explanatory and
+are not programs to paste into a native Windows C compiler.
+
+Learning order
+--------------
+1. Understand binary, hexadecimal, and fixed-width integers.
+2. Predict each line of demo_asm.c before running it.
+3. Practice masks, field extraction, and field replacement.
+4. Connect these operations to CPU instructions.
+5. Trace a word through the PIO echo program.
+6. Work through the exercises and compare with the answers.
+
+
+1. THE THREE LAYERS IN THIS SECTION
+===================================
+
+C source expresses an algorithm. A compiler translates it into instructions
+for its target CPU. Hardware then executes those instructions.
+
+demo_asm.c is ordinary C despite its filename. It contains no inline assembly
+and does not require a RISC-V CPU. Compiling it on an x86-64 computer normally
+produces x86-64 instructions, not RISC-V instructions.
+
+demo_pio.pio is a program for a separate programmable I/O engine. Its X register
+is unrelated to a RISC-V register named x1 or x2. Similar-looking assembly
+syntax does not make the two instruction sets interchangeable.
+
+Conceptual relationship:
+
+  C algorithm --> compiler --> CPU instructions
+                                 |
+                                 | configuration and data transfer
+                                 v
+                           PIO state machine
+
+For the echo example, the CPU supplies data and receives it back. The PIO
+program performs the small repeated transfer independently once configured.
+
+
+2. BINARY, HEXADECIMAL, AND BIT POSITIONS
+========================================
+
+A bit is either 0 or 1. A byte contains 8 bits. A nibble contains 4 bits.
+Bit positions start at zero on the right:
+
+  Position:  7 6 5 4 3 2 1 0
+  Value:     1 0 1 0 0 1 0 1
+  Weight:  128 64 32 16 8 4 2 1
+
+The value above is 128 + 32 + 4 + 1 = 165 decimal.
+Its hexadecimal representation is 0xA5.
+
+One hexadecimal digit represents exactly four bits:
+
+  Hex:     0    1    2    3    4    5    6    7
+  Binary: 0000 0001 0010 0011 0100 0101 0110 0111
+  Hex:     8    9    A    B    C    D    E    F
+  Binary: 1000 1001 1010 1011 1100 1101 1110 1111
+
+Therefore:
+
+  0xA5       = 1010 0101
+  0x0F       = 0000 1111
+  0xF0       = 1111 0000
+  0x1234     = 0001 0010 0011 0100
+  0xFFFFFFFF = 32 one-bits
+
+Leading zeros do not change a numeric value. They help show its width.
+The demo declares uint32_t x = 0xA5, so x has 32 bits, not eight:
+
+  00000000 00000000 00000000 10100101
+
+An unsigned 32-bit integer ranges from 0 to 2^32 - 1, or 4,294,967,295.
+Unsigned arithmetic wraps modulo 2^32 when the operation is performed in
+that unsigned 32-bit type. For example, adding one to its maximum gives zero.
+
+Two's complement interpretation
+------------------------------
+The same bit pattern can be interpreted differently depending on its type.
+For an N-bit two's-complement signed integer, a set top bit contributes
+-2^(N-1), while the remaining bits retain their positive weights.
+
+  Eight-bit 11111111: unsigned 255, signed -1.
+  Eight-bit 10000000: unsigned 128, signed -128.
+  Eight-bit 01111111: unsigned 127, signed 127.
+
+For bit manipulation, unsigned types usually make the intended behavior
+clearer. Do not assume signed overflow behaves like unsigned wraparound.
+
+
+3. THE SIX BITWISE OPERATIONS
+=============================
+
+AND, OR, and XOR work independently on corresponding pairs of bits:
+
+  a b | a & b | a | b | a ^ b
+  ----+-------+-------+------
+  0 0 |   0   |   0   |   0
+  0 1 |   0   |   1   |   1
+  1 0 |   0   |   1   |   1
+  1 1 |   1   |   1   |   0
+
+3.1 AND (&): retain selected bits
+--------------------------------
+AND with 1 preserves a bit; AND with 0 clears it.
+
+    1010 0101   x = 0xA5
+  & 0000 1111   mask = 0x0F
+  -----------
+    0000 0101   result = 0x05
+
+A mask is a value whose bit positions select where an operation applies.
+Here, four low one-bits select the low nibble.
+
+3.2 OR (|): force selected bits to one
+------------------------------------
+OR with 1 sets a bit; OR with 0 leaves it unchanged.
+
+    1010 0101
+  | 0000 1111
+  -----------
+    1010 1111   result = 0xAF
+
+3.3 XOR (^): toggle selected bits
+--------------------------------
+XOR with 1 flips a bit; XOR with 0 preserves it.
+
+    1010 0101
+  ^ 1111 1111
+  -----------
+    0101 1010   result = 0x5A
+
+Toggling twice restores the original value:
+
+  (x ^ mask) ^ mask == x
+
+Useful identities: x ^ x == 0, and x ^ 0 == x.
+In C, ^ means XOR, not exponentiation.
+
+3.4 NOT (~): invert all bits of the promoted operand
+--------------------------------------------------
+For the demo's 32-bit unsigned x:
+
+  x          = 0x000000A5
+  ~x         = 0xFFFFFF5A
+  ~x & 0xFF  = 0x0000005A
+
+The demo prints the last expression, so its output is 0x5A.
+The mask, not the printf format, limits the result to eight bits.
+
+3.5 Left shift (<<)
+------------------
+Moving left by n places inserts n zero-bits at the right.
+
+  0x000000A5 << 4 = 0x00000A50
+
+Here, 165 * 16 = 2640 = 0xA50. For a valid shift on an unsigned value,
+bits that leave the type's width are discarded. For example, shifting
+the 32-bit value 0x80000000 left by one gives zero.
+
+3.6 Right shift (>>)
+-------------------
+Unsigned right shift inserts zeros at the left and discards low bits.
+
+  0xA5 >> 4 = 0x0A
+
+For an unsigned integer, this corresponds to integer division by 2^n.
+Thus 165 / 16 = 10 with the remainder discarded.
+
+Shift safety
+------------
+For a 32-bit promoted operand, use shift counts from 0 through 31.
+A negative count or a count of 32 or more has undefined behavior in C.
+Use unsigned operands; signed left shifts can be undefined, and negative
+signed right shifts in C11 depend on the implementation.
+
+Do not confuse a PIO operand count of 32 with the C expression x << 32.
+They belong to different languages with different rules.
+
+
+4. COMMON MASK RECIPES
+======================
+
+For the following formulas, x is uint32_t and n is between 0 and 31.
+UINT32_C(1), from <stdint.h>, provides a suitable constant for these examples.
+On the demo's normal 32-bit-int targets, 1u is also suitable.
+
+  Set bit n:       x |=  UINT32_C(1) << n;
+  Clear bit n:     x &= ~(UINT32_C(1) << n);
+  Toggle bit n:    x ^=  UINT32_C(1) << n;
+  Extract bit n:   bit = (x >> n) & UINT32_C(1);
+  Test bit n:      if ((x & (UINT32_C(1) << n)) != 0) { ... }
+
+Why clearing works
+------------------
+To clear bit 0 of 0xA5:
+
+  1u << 0              = 0x00000001
+  ~(1u << 0)           = 0xFFFFFFFE
+  0xA5 & 0xFFFFFFFE    = 0xA4
+
+Only bit 0 meets a zero in the mask. Every other bit meets a one and survives.
+
+Extract a field
+---------------
+To extract w bits beginning at bit position p:
+
+  field = (x >> p) & ((UINT32_C(1) << w) - 1);
+
+This formula requires 1 <= w < 32 and 0 <= p <= 32 - w.
+For a complete 32-bit field, use x itself; do not evaluate 1u << 32.
+
+Example: extract bits 7 through 4 of 0xA5:
+
+  (0xA5 >> 4) & 0xF = 0xA
+
+The shift moves the field to bit 0. The mask removes everything above it.
+
+Replace a field
+---------------
+To replace bits 7 through 4 with 0x3 while keeping all other bits:
+
+  uint32_t mask = UINT32_C(0xF) << 4;
+  x = (x & ~mask) | ((UINT32_C(0x3) << 4) & mask);
+
+Starting at 0xA5:
+
+  clear old field: 0xA5 & ~0xF0 = 0x05
+  position value:  0x3 << 4     = 0x30
+  combine:         0x05 | 0x30  = 0x35
+
+Simply OR-ing 0x30 into 0xA5 gives 0xB5, not 0x35. OR cannot clear the old
+one-bits. The final mask also prevents a too-large replacement value from
+affecting neighboring fields.
+
+Pack and unpack bytes
+---------------------
+  uint32_t packed = (UINT32_C(0x12) << 8) | UINT32_C(0x34);
+  uint32_t high = (packed >> 8) & UINT32_C(0xFF);
+  uint32_t low  = packed & UINT32_C(0xFF);
+
+Results: packed = 0x1234, high = 0x12, low = 0x34.
+For arbitrary inputs, mask each byte before packing it.
+
+Endianness is a separate question: it describes byte order in memory.
+A uint32_t value 0x12345678 occupies bytes 78 56 34 12 in little-endian
+order, or 12 34 56 78 in big-endian order, from low to high address.
+The numeric expression (value >> 8) & 0xFF produces 0x56 in either case.
+PIO serial shift direction is another separate choice: which bits leave
+the shift register first. Do not infer it from the CPU's byte order.
+
+
+5. READING AND RUNNING demo_asm.c
+================================
+
+Headers:
+  <stdio.h> supplies printf.
+  <stdint.h> supplies fixed-width integer types such as uint32_t.
+
+Every printf in this demo evaluates an expression without assigning its
+result back to x. Consequently, every example starts from x == 0xA5.
+For example, x | 0x0F does not modify x; x |= 0x0F would modify it.
+
+Formatting:
+  %X    prints hexadecimal using uppercase letters.
+  %02X  requests at least two hexadecimal digits, padded with zero.
+  %u    prints an unsigned decimal integer.
+  \n    ends the output line.
+
+The width 02 is a minimum, not a truncation rule: printing 0x1234 with
+%02X still produces 1234.
+
+For strictly portable printing of uint32_t, use <inttypes.h> macros:
+
+  printf("0x%08" PRIX32 "\n", x);
+
+The demo's formats work on the tested host where uint32_t is unsigned int;
+that underlying type is not universal across all C implementations.
+
+Linux or the repository's Docker container, from section2-2:
+
+  cc -std=c11 -Wall -Wextra demo_asm.c -o demo_asm
+  ./demo_asm
+
+Windows PowerShell with GCC available, from section2-2:
+
+  gcc -std=c11 -Wall -Wextra demo_asm.c -o demo_asm.exe
+  .\demo_asm.exe
+
+Expected output, also verified by compiling and running the existing demo:
+
+  x & 0x0F = 0x05
+  x | 0x0F = 0xAF
+  x ^ 0xFF = 0x5A
+  ~x       = 0x5A
+  x << 4   = 0xA50
+  x >> 4   = 0xA
+  set bit 1    = 0xA7
+  clear bit 0  = 0xA4
+  test bit 7   = 1
+  bits 7..4    = 0xA
+  combine      = 0x1234
+
+The compiler can precompute these constant expressions. One C operator
+does not necessarily produce one instruction in the executable.
+
+
+6. FUNDAMENTALS OF LINK 1: RISC-V UNPRIVILEGED ISA
+=================================================
+
+The README links to the ratified-specification index [1]. Follow the
+Unprivileged ISA and RV32I links for the relevant foundation [2].
+
+An ISA defines software-visible instructions and their effects. It does
+not prescribe a particular pipeline or instruction execution time.
+RV32I has 32 integer registers of 32 bits; x0 always reads as zero.
+The program counter identifies the instruction being executed.
+
+Arithmetic and logical instructions operate on registers. Loads and stores
+transfer data between registers and memory. Immediate operands are constants
+encoded in instructions. Ordinary arithmetic immediates are sign-extended.
+Branches select control flow through comparisons; jumps can record a return
+address. Signed and unsigned comparisons interpret identical bits differently.
+
+Useful operation families:
+  AND/OR/XOR and ANDI/ORI/XORI: bitwise operations.
+  SLL/SRL/SRA: left, logical-right, and arithmetic-right shifts.
+  LW/SW: transfer a 32-bit word.
+  BEQ/BNE: branch on equality/inequality.
+
+RV32I uses 32-bit base instructions; optional extensions add capabilities.
+Do not assume every RISC-V implementation supports every extension.
+Unprivileged describes ordinary instruction behavior; privileged material
+covers mechanisms such as machine control and trap handling.
+
+Original worked translation exercise
+------------------------------------
+Suppose x10 already holds 0xA5. These snippets express the demo calculations:
+
+  andi x11, x10, 15       # x11 = 0x05
+  ori  x12, x10, 15       # x12 = 0xAF
+  xori x13, x10, 255      # x13 = 0x5A
+  slli x14, x10, 4        # x14 = 0xA50
+  srli x15, x10, 4        # x15 = 0x0A
+
+To compute a whole-register inversion and then retain its low byte:
+
+  xori x16, x10, -1       # x16 = 0xFFFFFF5A
+  andi x16, x16, 255      # x16 = 0x0000005A
+
+To replace the high nibble with 3:
+
+  andi x11, x10, -241     # clear 0xF0: mask is 0xFFFFFF0F
+  ori  x11, x11, 48       # insert 0x30; result 0x35
+
+Trace each line by writing the input, mask, and result in hexadecimal.
+These examples illustrate equivalent calculations, not a promise about
+the exact assembly a C compiler will generate.
+
+
+7. FUNDAMENTALS OF LINK 2: RP2350 DATASHEET, PIO
+===============================================
+
+The README's second link is the RP2350 datasheet [3]. In the official
+2025-07-29 edition inspected through [4], PIO is Chapter 11.
+
+PIO implements small I/O programs independently of the CPU. RP2350 has
+three PIO blocks, each with four state machines sharing 32 instruction
+slots. Each state machine has 32-bit X/Y scratch registers, ISR/OSR shift
+registers, FIFO interfaces, and a configurable clock divider.
+
+The usual FIFO arrangement provides four 32-bit words in each direction.
+Joining FIFOs can allocate eight words to one direction. This echo needs
+both directions. PIO has instruction storage and FIFOs, but no ordinary
+general-purpose data RAM accessible through CPU-style load/store instructions.
+Thus the demo comment "no memory" is a simplification.
+
+Read the datasheet's overview, programmer's model, instruction descriptions,
+and FIFO/shift configuration together. Program text alone does not specify
+all runtime behavior. The echo's critical settings are a 32-bit autopull
+threshold and disabled autopush because it explicitly uses PUSH.
+
+PIO is useful for timed pin activity and custom interfaces. Its instruction
+set is distinct from RISC-V; it is not a general-purpose CPU replacement.
+
+SDK configuration reference
+---------------------------
+The official SDK API documentation [5] explains how software configures a
+state machine. sm_config_set_out_shift selects shift direction, autopull,
+and the pull threshold. sm_config_set_in_shift selects the corresponding
+input behavior. Configuration is applied during state-machine initialization.
+The SDK also provides blocking FIFO write/read helpers.
+
+The .pio directives describe a program to the assembler. .program names
+it; .wrap_target and .wrap mark the loop boundaries. Wrapping avoids a
+separate loop-back jump instruction. An actual hardware application must
+assemble and load the program, configure and initialize a state machine,
+then enable it. The repository deliberately supplies neither the Pico SDK
+nor a complete board application.
+
+
+8. STEP-BY-STEP PIO ECHO WALKTHROUGH
+====================================
+
+The existing program:
+
+  .program echo
+  .wrap_target
+      out x, 32
+      in  x, 32
+      push
+  .wrap
+
+Read OUT and IN relative to the shift registers:
+
+  OUT: extract data from OSR into the named destination.
+  IN:  insert data from the named source into ISR.
+
+Neither instruction here names pins. This program echoes FIFO data; it
+does not transmit the word over an external wire.
+
+The data path shown in the local demo is:
+
+  CPU --> TX FIFO --> OSR --> X --> ISR --> RX FIFO --> CPU
+                     OUT ---^     ^--- IN   ^
+                                           |
+                                         PUSH
+
+TX means the CPU sends toward PIO; RX means the CPU receives from PIO.
+FIFO means first in, first out: queued words preserve their order.
+
+Trace one word
+--------------
+Assume the CPU sends 0x12345678, autopull is configured for 32 bits,
+autopush is disabled, and the state machine has been correctly initialized.
+
+  Stage                      Meaningful value
+  -------------------------  -------------------------------------------
+  CPU queues input           TX FIFO contains 0x12345678.
+  Word supplied to OSR       OSR supplies that word for the OUT operation.
+  out x, 32                  X becomes 0x12345678.
+  in x, 32                   ISR becomes 0x12345678.
+  push                       The word is submitted to RX FIFO.
+  CPU reads RX FIFO          CPU receives 0x12345678.
+
+This is a logical data trace, not a cycle-accurate description of when
+automatic refills occur. Avoid assuming that OSR still contains the old
+word after OUT; shifting and automatic refill change its state.
+
+Because each transfer uses all 32 bits, the demonstration avoids partial
+word packing. It does not reverse the bits of 0x12345678. A partial transfer,
+such as out x, 8, would require careful reasoning about shift direction,
+the remaining OSR bits, and the automatic transfer threshold.
+
+Why two shift registers?
+------------------------
+Imagine assembling a word from several small input groups while another
+word is being consumed for output. Separate input and output registers
+keep these two streams independent. X is temporary storage between the
+streams in this particular example; Y is unused.
+
+Why FIFOs?
+----------
+A producer and consumer do not always run at the same instant. A FIFO
+temporarily absorbs this mismatch. It cannot absorb an unlimited mismatch.
+
+For example, if the CPU sends words A, B, and C and later receives three
+echoes, the intended order is A, B, C. If it keeps sending without reading,
+the receive side can fill, stopping further progress in a blocking design.
+
+Blocking and automatic transfers
+-------------------------------
+For the precise instruction semantics, see the datasheet [3, 4]. A plain
+PUSH uses blocking behavior by default: a full RX FIFO prevents it from
+completing. Autopull prevents OUT from consuming unavailable fresh data.
+Successful PUSH clears ISR and resets its input shift count. "Empty" for
+autopull refers to the shift count and threshold, not OSR's numeric value.
+The word zero is valid data.
+
+In this echo, enabling 32-bit autopush as well as the explicit PUSH would
+make IN automatically submit the word and the following PUSH submit an
+additional cleared value. Keep autopush off for the shown program.
+
+These behaviors explain three practical checks:
+
+  No output: check that input was queued, the machine was enabled, and
+  autopull was configured before blaming the three PIO instructions.
+
+  Unexpected extra words: check automatic pushing versus explicit PUSH.
+
+  Stops after several words: check whether the CPU is draining RX FIFO.
+
+Avoiding a circular wait
+-----------------------
+Consider a CPU that first sends a very large batch using blocking writes
+and plans to read echoes only after finishing the batch. Eventually RX
+can fill, PIO can stop at PUSH, TX can fill, and the CPU can stop writing.
+Neither side then reaches the operation needed to unblock the other.
+
+For a simple learning application, send one word and receive one echo
+before sending the next. A streaming application needs deliberate servicing
+of both directions, potentially with interrupts or DMA. DMA moves data;
+it does not remove FIFO capacity limits or automatically fix ordering bugs.
+
+
+9. COMMON C AND HARDWARE MISUNDERSTANDINGS
+==========================================
+
+Bitwise versus logical operators
+-------------------------------
+  0xA5 & 0x0F  = 5
+  0xA5 && 0x0F = 1
+
+&& and || evaluate truth values and short-circuit. & and | combine bits.
+Likewise !x is a logical test producing 0 or 1, while ~x flips bits.
+
+Parentheses
+-----------
+Use:
+
+  if ((x & mask) == 0) { ... }
+
+Do not write x & mask == 0 expecting the same grouping. Equality binds
+more tightly than bitwise AND, making that x & (mask == 0).
+
+Integer promotions
+------------------
+Operations on uint8_t commonly promote it to int first. Consequently,
+~small_byte is not necessarily an eight-bit result. Explicitly mask or
+convert the result to the intended unsigned width.
+
+Hardware registers versus ordinary variables
+-------------------------------------------
+Mask recipes describe values. Applying them to a peripheral register also
+requires knowing that register's documented read/write semantics.
+Some bits clear when written with one; some registers have side effects.
+A generic read-modify-write operation is not universally appropriate.
+
+The C keyword volatile does not provide thread synchronization or make
+a multi-step operation atomic. A read, mask calculation, and write can
+still be interrupted by another writer. Follow the device's register
+interface and concurrency requirements when moving beyond this demo.
+
+Source code versus configuration
+-------------------------------
+Reading only three PIO instructions is insufficient to explain a complete
+application. State-machine configuration is part of the program's meaning.
+Conversely, compiling the C demo successfully says nothing about whether
+a separate PIO configuration is correct.
+
+
+10. PRACTICE QUESTIONS
+======================
+
+Try these without running code first. Use unsigned 32-bit values.
+
+1. Convert 0xD6 into binary and decimal.
+2. For x = 0xD6, calculate x & 0x0F, x | 0x0F, and x ^ 0xFF.
+3. Starting independently from 0xD6, set bit 0, clear bit 7, and toggle bit 2.
+4. Extract bits 6 through 3 of 0xD6.
+5. Replace bits 7 through 4 of 0xD6 with 0x2.
+6. Pack bytes 0xAB and 0xCD into 0xABCD, then extract each byte.
+7. What is the difference between ~UINT32_C(0xA5) and
+   (~UINT32_C(0xA5)) & UINT32_C(0xFF)?
+8. Why is UINT32_C(1) << 32 unsuitable on a 32-bit promoted operand?
+9. Does evaluating x | 1 change x?
+10. Trace x10 = 0xD6 through srli x11, x10, 3 followed by
+    andi x11, x11, 15.
+11. Trace PIO input 0xCAFEBABE through X and ISR to the CPU.
+12. Does out x, 32 drive 32 GPIO pins?
+13. What happens if the CPU never reads the echo's RX FIFO?
+14. Is a zero-valued OSR necessarily empty?
+15. Why is "32 instruction slots per state machine" misleading here?
+16. Which configuration setting would conflict with the explicit PUSH?
+
+
+11. ANSWERS AND REASONING
+=========================
+
+1. 1101 0110; 128 + 64 + 16 + 4 + 2 = 214.
+
+2. 0x06, 0xDF, 0x29. AND keeps the low nibble; OR fills it with ones;
+   XOR flips the eight selected bits.
+
+3. Set bit 0: 0xD7. Clear bit 7: 0x56. Toggle bit 2: 0xD2.
+   These are independent operations, not a sequence.
+
+4. (0xD6 >> 3) & 0xF = 0x1A & 0xF = 0xA.
+
+5. (0xD6 & ~0xF0u) | 0x20u = 0x26.
+
+6. (0xABu << 8) | 0xCDu = 0xABCD.
+   High byte: (value >> 8) & 0xFF. Low byte: value & 0xFF.
+
+7. The first is 0xFFFFFF5A on the stated 32-bit model. The second is 0x5A.
+   A mask controls retained bits; printf field width does not.
+
+8. A shift count equal to the promoted operand width is undefined in C.
+   To represent all 32 one-bits, use UINT32_MAX instead.
+
+9. No. Assign the result, or use x |= 1, to modify x.
+
+10. After SRLI, x11 = 0x1A; after ANDI, x11 = 0xA.
+
+11. Under the stated echo configuration, X receives 0xCAFEBABE, ISR receives
+    0xCAFEBABE, and the CPU receives 0xCAFEBABE from RX FIFO.
+
+12. No. Its named destination is X, not pins.
+
+13. RX eventually fills; blocking PUSH stops further progress. Further
+    CPU writes can eventually fill TX as well.
+
+14. No. Zero is a legitimate payload. Shift counters and thresholds track
+    consumption, independently of whether the data bits are zero.
+
+15. The 32 slots are shared by four state machines within one PIO block.
+
+16. Enabling autopush at 32 bits would already submit the full ISR on IN;
+    the explicit PUSH would then add an unwanted transfer.
+
+
+12. FINAL REVISION SHEET
+========================
+
+  Bit n has weight 2^n; bit numbering begins at zero.
+  One hexadecimal digit represents four bits.
+  AND retains; OR sets; XOR toggles; NOT inverts.
+  Shift, then mask, to extract a field.
+  Clear, position, then OR, to replace a field.
+  Use unsigned values and valid shift counts.
+  Bitwise operators are different from logical operators.
+  A computed expression does not modify x without an assignment.
+  CPU assembly and PIO assembly are different languages.
+  Trace echo data as TX -> OSR -> X -> ISR -> RX.
+  Check configuration as well as instructions.
+  FIFOs buffer temporary mismatches; they are finite.
+
+You are ready to move on when you can explain every output line in the
+C demo, replace a bit field without damaging its neighbors, and trace a
+PIO word while explaining what happens when either FIFO cannot progress.
+
+
+13. REFERENCES AND VERIFICATION SCOPE
+====================================
+
+Local sources:
+  README.md       Scope and the original two reading links.
+  demo_asm.c      C expressions and expected output.
+  demo_pio.pio    Echo instructions and introductory data path.
+
+[1] RISC-V International: Ratified Specifications (original README link)
+    https://riscv.org/specifications/ratified/
+
+[2] RISC-V Ratified Specifications Library: RV32I Base Integer ISA
+    https://docs.riscv.org/reference/isa/v20260120/unpriv/rv32.html
+    The direct chapter reached from the official documentation was used
+    to check the concise ISA fundamentals above.
+
+[3] Raspberry Pi: RP2350 Datasheet (original README link)
+    https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf
+
+[4] Official Raspberry Pi-hosted datasheet copy used for access
+    https://pip-assets.raspberrypi.com/categories/1214-rp2350/documents/RP-008373-DS-2-rp2350-datasheet.pdf?disposition=inline
+    This copy identifies build date 2025-07-29. Chapter numbering can change
+    between editions; find the chapter titled PIO in your downloaded copy.
+
+[5] Raspberry Pi Pico SDK: Hardware APIs, hardware_pio
+    https://www.raspberrypi.com/documentation/pico-sdk/hardware.html#hardware_pio
+
+Verification: the existing demo_asm.c was compiled on the available Windows
+GCC host with -std=c11 -Wall -Wextra, and its output matched Section 5.
+The PIO explanation is a reading walkthrough; it was not run on hardware.
+The RISC-V snippets are original illustrative calculations, not a tested
+standalone assembly program. The summaries are selective foundations for
+this demo, not replacements for either complete specification.

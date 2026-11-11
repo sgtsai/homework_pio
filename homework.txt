@@ -1,0 +1,376 @@
+SECTION 2.2 PROJECT HOMEWORK
+Bitstream Packet Processor: Correctness Under Backpressure
+=========================================================
+
+Difficulty: advanced. Suggested effort: 8-16 hours after tutorial.txt.
+Prerequisites: unsigned bitwise C operations, masks, shifts, branches,
+register tracing, and the OSR/ISR/FIFO data path from section2-2.
+
+Your task is to implement and optimize a streaming packet transformation
+using a small, fully specified teaching machine. The supplied Python judge
+assembles and executes your program, checks its outputs, and measures its
+simulated cycle count and memory footprint. No board, SDK, network service,
+or third-party Python library is required.
+
+This is a custom teaching ISA, inspired by RISC-V register operations and
+PIO streaming. It is NOT real RISC-V or real RP2350 PIO assembly. In
+particular, its eight registers, instruction encoding, 64-slot capacity,
+strict shift-counter checks, and lack of automatic transfers are exercise
+rules. Do not paste your submission into pioasm or a RISC-V assembler.
+
+1. DELIVERABLES
+==============
+
+Submit:
+  submission.asm       Your complete target-machine program.
+  report.txt           Complete the supplied report_template.txt.
+  result.json          Output of the unmodified judge with --json.
+
+Only submission.asm is executed. The report explains your reasoning and is
+required for the homework, but introduces no subjective scoring points.
+The instructor recomputes result.json using a trusted copy of grade.py.
+Editing the judge or its inputs cannot change the official score.
+
+The supplied submission.asm is an intentionally wrong double-echo starter,
+not a partially completed transformation algorithm.
+
+2. INPUT PACKET AND REQUIRED OUTPUT
+===================================
+
+Each input is one unsigned 32-bit word:
+
+  Bits       31.........24 23.........16 15..........8 7...........0
+  Field      tag           sequence      flags        payload
+  Width      8 bits        8 bits        8 bits       8 bits
+
+For EACH input word w, produce EXACTLY TWO 32-bit words in this order:
+
+  Output 1 = transformed packet T.
+  Output 2 = updated rolling checksum C.
+
+Define:
+
+  tag_out = tag XOR 0xA5
+  seq_out = (sequence + 1) modulo 256
+  count   = number of set bits in flags (an integer from 0 to 8)
+  rev     = payload's eight bits in reverse order
+
+  T = (tag_out << 24) | (seq_out << 16) | (count << 8) | rev
+
+The checksum starts at zero once per stream, not once per packet:
+
+  C = ROTL32(C, 5) XOR T
+
+where ROTL32 rotates the OLD checksum five positions to the left, moving
+the old top five bits into the low five positions. Keep exactly 32 bits.
+Unsigned logical shift is not rotation; shifting alone loses bits.
+
+Bit reversal examples:
+  00000001 -> 10000000
+  01111000 -> 00011110
+  10100101 -> 10100101
+
+Population count examples:
+  00000000 -> 0
+  10000001 -> 2
+  11111111 -> 8
+
+Sequence overflow must NOT increment the tag. Fields must remain isolated.
+All values, including zero and 0xFFFFFFFF, are ordinary data. There is no
+sentinel word marking the end of a stream.
+
+3. WORKED EXAMPLES
+==================
+
+Example A: one-word stream [0x00000000]
+  tag 0x00 -> 0xA5; sequence 0 -> 1; count 0; reverse 0.
+  T = 0xA5010000.
+  C = ROTL32(0,5) XOR T = 0xA5010000.
+  Output stream: [0xA5010000, 0xA5010000].
+
+Example B: fresh one-word stream [0xFFFFFFFF]
+  tag 0xFF -> 0x5A; sequence 255 -> 0; count 8; reverse 0xFF.
+  Output stream: [0x5A0008FF, 0x5A0008FF].
+
+Example C: fresh one-word stream [0x12345678]
+  tag 0x12 -> 0xB7; sequence 0x34 -> 0x35.
+  flags 0x56 = 01010110 has four set bits.
+  payload 0x78 = 01111000 reverses to 00011110 = 0x1E.
+  Output stream: [0xB735041E, 0xB735041E].
+
+Example D: two-word stream [0, 0]
+  T1 = T2 = 0xA5010000.
+  C1 = 0xA5010000.
+  ROTL32(C1,5) = 0xA0200014.
+  C2 = 0xA0200014 XOR 0xA5010000 = 0x05210014.
+  Output stream:
+    [0xA5010000, 0xA5010000, 0xA5010000, 0x05210014].
+
+4. MACHINE STATE AND SYNTAX
+===========================
+
+Eight unsigned 32-bit registers: r0..r7.
+  r0 always reads as zero. Writes to r0 are discarded.
+  r1..r7 start at zero and persist across packets and stalls.
+
+Two 32-bit shift registers: OSR and ISR, initially zero.
+  OSR starts consumed: OUT requires a PULL first.
+  ISR starts with zero accumulated bits.
+
+Two FIFOs: TX and RX, each holding up to four 32-bit words.
+  Host -> TX -> PULL -> OSR -> OUT -> general register.
+  General register -> IN -> ISR -> PUSH -> RX -> host.
+
+Program counter starts at instruction zero. Programs contain 1..64
+instructions. There is no implicit wrap and no HALT: jump back to PULL
+after finishing each packet. After the stream ends, the program should
+wait at PULL with all output delivered.
+
+Syntax:
+  One instruction per line; commas between operands are optional.
+  # begins a comment.
+  Labels use letters, digits, and underscores, and cannot start with a digit.
+  A label ends with ':' and may precede an instruction on the same line.
+  Opcodes/register names are lowercase and labels are case-sensitive.
+  Decimal and 0x-prefixed hexadecimal integers are accepted.
+  Immediates range from -2147483648 through 4294967295; negative values
+  are interpreted modulo 2^32 in arithmetic and bitwise operations.
+  Labels and comments consume no instruction slots.
+
+This teaching encoding reserves eight bytes for EVERY instruction:
+  opcode, destination, source1, source2: one byte each;
+  immediate or branch target: four bytes.
+Unused fields remain reserved. No short or compressed encodings exist.
+This is the accounting format; you submit text, not binary machine code.
+
+5. COMPLETE INSTRUCTION REFERENCE
+=================================
+
+Notation: d, a, b are registers; k is an immediate; L is a label.
+All arithmetic results wrap to 32 bits. Source values are read before
+the destination is written, so the destination may alias a source.
+
+  li   d, k         d = k modulo 2^32
+  add  d, a, b      d = a + b modulo 2^32
+  addi d, a, k      d = a + k modulo 2^32
+  and  d, a, b      d = a AND b
+  andi d, a, k      d = a AND k
+  or   d, a, b      d = a OR b
+  ori  d, a, k      d = a OR k
+  xor  d, a, b      d = a XOR b
+  xori d, a, k      d = a XOR k
+  shl  d, a, k      d = a shifted left k places; discard overflow
+  shr  d, a, k      d = a shifted right k places; insert zeros
+  jnz  a, L        jump to L if a is nonzero; otherwise advance
+  jmp  L           unconditionally jump to L
+
+Shift immediates must be 0..31. There is no arithmetic right shift.
+There is no multiply, divide, popcount, reverse, rotate, lookup-table,
+general RAM, stack, subroutine instruction, or input-length instruction.
+You must construct the required operations from this list.
+
+PIO-inspired transfers:
+
+  pull
+    If TX is empty, stall with all machine state unchanged.
+    Otherwise remove its oldest word into OSR and reset consumed bits to 0.
+    A PULL may replace an incompletely consumed OSR; those old bits are lost.
+
+  out d, n
+    n must be 1..32. Copy OSR's low n bits into d, zero-extending.
+    Shift OSR right n places and increase consumed bits by n.
+    Consuming more than 32 bits since the last PULL is a runtime failure.
+    n = 32 is legal here and leaves OSR zero.
+
+  in a, n
+    n must be 1..32. Shift ISR left n places and append a's low n bits.
+    Increase accumulated bits by n. More than 32 accumulated bits is a
+    runtime failure. n = 32 replaces ISR with the entire source register.
+
+  push
+    Requires exactly 32 accumulated bits.
+    If RX is full, stall with all state unchanged.
+    Otherwise append ISR to RX, then clear ISR and its accumulated count.
+
+There is NO autopull or autopush in this project. The explicit operations
+make the dataflow and instruction cost visible. In particular, a stalled
+PUSH must not repeat the checksum update or clear ISR prematurely.
+
+6. TIMING, BACKPRESSURE, AND TERMINATION
+=======================================
+
+Each simulation tick performs these steps IN ORDER:
+  1. Host may enqueue one input if TX has room.
+  2. Host may dequeue one output if RX is nonempty.
+  3. Machine attempts one instruction.
+
+A completed instruction costs one retired cycle. A stalled instruction
+consumes an elapsed tick but does not retire and contributes no retired
+cycle. Branches, PULL, and PUSH each cost one cycle when completed.
+
+Input/output schedules, using tick numbers starting at zero:
+  fast:     input and output allowed every tick.
+  slow_tx:  input allowed only when tick % 193 == 0; output every tick.
+  slow_rx:  input every tick; output only when tick % 127 == 0.
+  bursty:   input when tick % 211 < 5;
+            output when tick % 173 is 0, 1, or 2.
+
+The host never changes input order and never inserts a sentinel. When all
+inputs have been queued, TX/RX are empty, and the machine has stalled at
+PULL for 64 consecutive ticks, the judge ends the run. It then checks the
+entire output list, including its length. Missing/extra outputs fail.
+
+Runtime errors include leaving program memory, invalid shift-register
+usage, and exceeding max(10000, 4096*N) elapsed ticks for N input words.
+This is a deterministic instruction-level timeout, NOT a wall-clock limit.
+An infinite branch loop therefore cannot hang the grader indefinitely.
+
+7. FIXED SCORING STANDARD: EXACTLY 100 POINTS
+===========================================
+
+A. Correctness: 60 points
+------------------------
+Six suites, 10 points each. A suite earns either 10 or 0; every output and
+its order must match. Runs start with fresh zero registers/checksum.
+
+  Suite                  Input count  Schedule  Coverage
+  edge_values                  6      fast      zeros, ones, boundary bits
+  reverse_exhaustive         256      fast      all 256 payload values
+  popcount_exhaustive        256      slow_tx   all 256 flags values
+  header_wrap              1,024      fast      all tags, 4 sequence edges
+  backpressure             1,024      slow_rx   seeded random packets
+  long_stream              4,096      bursty    seeded random packets/state
+
+The complete deterministic construction is in suites() in grade.py.
+The random generator is Python random.Random with seed 2202350, shared
+between the last two suites. No test data is secretly changed after release.
+All seed choices and input lengths are fixed.
+
+B. Execution efficiency: 20 points
+----------------------------------
+Eligible only after ALL SIX correctness suites pass AND a separate fixed
+performance stream produces completely correct output.
+
+Performance stream:
+  8,192 words from a fresh random.Random(22099), getrandbits(32).
+  Fast host schedule. Fresh machine state.
+
+Let R be ALL retired instructions from program start until quiescence,
+including initialization and final loop-back instructions. Let C = R/8192.
+No rounding is applied when selecting a score tier:
+
+  Retired cycles per input C     Points
+  C <= 100                       20
+  100 < C <= 150                  15
+  150 < C <= 250                   8
+  C > 250                         0
+
+The judge uses integer comparisons R <= threshold*8192 to avoid rounding.
+It measures the executable program, not a value reported by the student.
+
+C. Memory efficiency: 20 points
+-------------------------------
+Uses the same eligibility gate as B. This is SIMULATED TARGET MEMORY,
+not Python process RAM, Windows working set, or text-file size.
+
+Let L be the number of assembled instructions, including unreachable code.
+
+  M = 96 + 8*L bytes
+
+Fixed 96-byte reservation:
+  general registers             32 bytes
+  OSR and ISR                    8 bytes
+  two four-word FIFOs           32 bytes
+  controller/counter reservation 24 bytes
+
+The controller reservation is an accounting constant for this exercise,
+not a claim about the transistor layout or C struct size of real hardware.
+There is no other student-accessible storage or heap allocation.
+Judge-owned input/output lists and the Python interpreter are excluded.
+
+  Memory M                Equivalent L        Points
+  M <= 352 bytes          L <= 32               20
+  352 < M <= 480 bytes    33 <= L <= 48          12
+  480 < M <= 608 bytes    49 <= L <= 64           5
+
+More than 64 instructions is rejected before execution: total score 0.
+Assembly errors also give total score 0. A runtime error fails that suite.
+Any failed correctness suite makes BOTH efficiency components zero.
+Failure of the separate performance stream also makes BOTH components zero.
+
+Total = A + B + C, an integer from 0 to 100. No subjective adjustments.
+Passing mark: 60. Full marks require all functional checks, C <= 100,
+and L <= 32 simultaneously. A compact solution meeting these targets
+has been checked during assignment preparation; the thresholds are feasible.
+
+8. RUNNING THE JUDGE
+====================
+
+From this homework directory, with Python 3.9 or newer:
+
+  python grade.py submission.asm
+  python grade.py submission.asm --json > result.json
+  python selftest.py
+
+Use python3 instead of python on systems where that is the command name.
+Only the Python standard library is used. The existing Dockerfile is not
+required. The supplied C demo can still be used for independent experiments.
+
+The grader prints each suite's pass/fail result, instruction count, modeled
+memory, retired cycles/input, and score. JSON also records a SHA-256 hash
+of the submitted source. Process exit code is 0 for scores >=60 and 1
+otherwise, so the unimplemented starter is expected to exit with code 1.
+
+Self-tests check the supplied judge, not the student's solution. Passing
+selftest.py does not earn homework points.
+
+9. DEVELOPMENT MILESTONES AND HINTS
+===================================
+
+Milestone 1: explain the starter's TX -> OSR -> register -> ISR -> RX path.
+Predict why double echo fails the transformation specification.
+
+Milestone 2: implement one packet correctly. Use masking to isolate fields.
+Check payload=1, flags=255, sequence=255, and tag=255 independently.
+
+Milestone 3: add checksum state. Check the two-zero-word example, which
+distinguishes persistent checksum state from reinitializing every packet.
+
+Milestone 4: pass slow output and bursty streams. Maintain each transformed
+packet and its checksum until both required words have been submitted.
+
+Milestone 5: optimize cycles and program size together. Explore processing
+several fields during the same loop, extracting bits through shifts, and
+reusing registers after a value becomes dead. Unrolling can reduce branches
+while increasing instruction memory; measure both effects.
+
+Do not assume a larger immediate is more expensive: this teaching machine
+has fixed eight-byte instruction records. Do not use input-specific tables,
+external state, or host Python code in the submission: the assembler has
+no facilities to execute or reference them.
+
+For scratch calculations in C, use uint32_t, valid shift counts, and masks.
+Remember that ~ operates across the promoted operand width. Be careful
+with (x & mask) == 0 parentheses and with | versus ||.
+
+10. CONNECTION TO THE TWO READING LINKS
+=======================================
+
+RISC-V Unprivileged ISA:
+  https://riscv.org/specifications/ratified/
+Practice the register-machine view, a zero register, immediate constants,
+fixed-width bitwise operations, conditional branches, and the distinction
+between source algorithms and instruction execution. The exact syntax,
+encoding, and timing for THIS homework are defined above, not by RISC-V.
+
+RP2350 datasheet, PIO chapter:
+  https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf
+Practice stream ordering, explicit OSR/ISR transfers, limited FIFO capacity,
+blocking, and independent producer/consumer rates. The real device has its
+own instruction set, register resources, timing rules, and automatic transfer
+options. This exercise deliberately uses a small hybrid model so you can
+study both families of concepts without a board.
+
+Read reading/tutorial.txt alongside this assignment. Completing the project
+should demonstrate that you can reason about bit patterns, register
+liveness, streaming state, and measurable time/space tradeoffs together.
