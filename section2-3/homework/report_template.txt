@@ -1,0 +1,34 @@
+SECTION 2.3 HOMEWORK REPORT
+==========================
+Name:
+Compiler/platform:
+Correctness score:
+Independent-progress score:
+Memory score:
+Total:
+
+1. Queue representation and invariants
+Explain your head/tail/count fields and which lock protects each field.
+
+2. Waiting and shutdown
+Write each condition-variable predicate in words. Explain why close wakes
+both kinds of waiters, and why accepted jobs are drained after close.
+
+3. Descriptor validation
+Explain your overflow check, alignment check, and required-byte calculation
+for incrementing versus fixed source/destination addresses.
+
+4. Ownership and completion
+Explain descriptor lifetime, buffer lifetime, empty versus finished, and
+what joining the workers guarantees to the caller.
+
+5. Independent progress
+Explain why the queue is usable while one transfer's copy hook is paused.
+
+6. Memory measurement
+Record sizeof(hw_queue), normalized Q, slot storage S, and overhead H.
+Explain why the test does not measure the whole process's memory usage.
+
+7. Concurrency audit
+Answer the questions in homework.txt Section 12. Record any sanitizer
+results accurately, including unavailable tooling or tests not run.

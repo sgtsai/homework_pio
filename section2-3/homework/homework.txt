@@ -1,0 +1,600 @@
+SECTION 2.3 PROJECT HOMEWORK
+Build a Safe Asynchronous Transfer Queue
+=======================================
+
+Difficulty: advanced beginner to intermediate systems programming.
+Suggested effort: 8-16 hours after reading ../tutorial.txt.
+Language: C11 with POSIX threads. No microcontroller is required.
+
+1. YOUR MISSION
+===============
+
+Several producer threads submit memory-transfer jobs. Several worker threads
+take those jobs from a shared queue and perform the transfers. The queue can
+hold exactly eight waiting jobs. If it is full, producers wait. If it is
+empty, workers wait. Closing the queue stops new submissions but allows all
+already accepted jobs to finish.
+
+Build this safely, without volatile-based synchronization, lost jobs, busy
+polling, out-of-bounds transfers, or locks held during slow transfer work.
+
+The assignment combines Section 2.3's two ideas:
+  Critical sections protect shared queue metadata.
+  Descriptors specify asynchronous copy/fill work and its memory requirements.
+
+This is a software transfer engine. Worker threads still consume CPU time;
+it is not real hardware DMA. The judge supplies pthread creation/joining and
+the low-level copy hook. You implement the queue, validation, transfer loop,
+and worker function that connect them.
+
+2. DELIVERABLES AND FILES
+========================
+
+Edit and submit:
+  submission.c     Implement all eight functions.
+  submission.h     Queue representation; preserve the public API and required
+                   synchronization member names/types.
+  report.txt       Complete report_template.txt in your own words.
+
+Do not edit these for grading:
+  api.h            Descriptor type, capacity, and low-level copy-hook contract.
+  judge.c          Public correctness and independent-progress tests.
+  grade.py         Compiler invocation and fixed scoring.
+
+The supplied starter intentionally returns failure and scores 0/100.
+No completed solution is included. Keep the original Section 2.3 demos
+unchanged; this homework is a separate project with a separate API.
+
+3. THE DATA FLOW
+================
+
+  producer threads
+        |
+        | hw_push: copy a descriptor into the queue
+        v
+  [ job ][ job ][ job ] ... at most 8 waiting descriptors
+        |
+        | hw_pop: remove the oldest queued descriptor
+        v
+  worker threads -> hw_transfer -> hw_copy_unit -> destination buffer
+
+The queue stores descriptor COPIES. The descriptors contain pointers to
+caller-owned buffers; the queue does not copy the buffer contents.
+
+A descriptor can be a producer's temporary local object because hw_push
+copies its fields before returning success. The actual source/destination
+buffers must remain alive until the corresponding work has completed.
+The provided tests keep their buffers alive until workers are joined.
+
+4. TRANSFER DESCRIPTOR AND VALIDATION
+====================================
+
+hw_job fields:
+  src, dst            Initial source and destination addresses.
+  count               Number of transfers, NOT bytes.
+  size                Bytes per transfer: exactly 1, 2, or 4.
+  src_bytes           Accessible bytes beginning at src.
+  dst_bytes           Accessible bytes beginning at dst.
+  src_increment       Advance source by size after each transfer?
+  dst_increment       Advance destination by size after each transfer?
+
+hw_validate(job) must return 0 if valid and -1 if invalid. It must not
+modify memory, queue state, or the descriptor, or call hw_copy_unit.
+
+Reject the descriptor if ANY of these hold:
+  - job, src, or dst is NULL;
+  - size is not 1, 2, or 4;
+  - count is zero;
+  - either address is not divisible by size;
+  - count*size would overflow SIZE_MAX;
+  - an incrementing side has fewer than count*size accessible bytes;
+  - a fixed-address side has fewer than size accessible bytes.
+
+The multiplication-overflow rule applies even when both addresses are fixed.
+Check before multiplying. A wrapped multiplication must not turn an invalid
+large transfer into an apparently small valid one.
+
+Pointers in otherwise valid tests refer to live storage, and input/output
+regions do not overlap. You do not have to detect fabricated addresses or
+overlap. src_bytes/dst_bytes are caller-provided capacities, not a mechanism
+for discovering an arbitrary allocation's actual size.
+
+Example:
+  count=16, size=4, both sides increment -> each side needs at least 64 bytes.
+  count=16, size=4, fixed source -> source needs 4 bytes, destination 64 bytes.
+
+5. TRANSFERRING DATA
+===================
+
+hw_transfer(job) must validate the COMPLETE job first. If invalid, return
+-1 without writing any destination bytes or calling hw_copy_unit at all.
+
+For a valid descriptor, perform exactly count calls to:
+
+  hw_copy_unit(destination_address, source_address, size);
+
+Use byte-address arithmetic:
+  source for transfer i = src + (src_increment ? i*size : 0)
+  dest   for transfer i = dst + (dst_increment ? i*size : 0)
+
+Return 0 after all transfers have finished. Do not change the caller's
+descriptor. Do not touch bytes outside the required destination region.
+
+Increment modes:
+  source true,  destination true   -> sequential copy
+  source false, destination true   -> repeat one source item (fill)
+  source true,  destination false  -> overwrite one destination item;
+                                     last source item remains
+  source false, destination false  -> repeatedly copy one fixed item
+
+The judge's hw_copy_unit is a real copy operation plus an instrumentation
+point. It can deliberately pause to model a slow device. Do not bypass it
+using your own memcpy, direct stores, or another copying mechanism. Call it
+only from hw_transfer, once per item. A paused call has not yet completed.
+
+6. THE SHARED QUEUE
+==================
+
+hw_queue_init(q):
+  Initialize empty/open queue state and the required mutex/condition variables.
+  Return 0 on success or -1 if initialization fails. If initialization partly
+  succeeds then fails, clean up synchronization objects already initialized.
+  The caller provides uninitialized storage; do not depend on it being zero.
+
+hw_push(q, job):
+  If closed, return 0 immediately without accepting the job.
+  While full and still open, wait for room.
+  When room exists and the queue is still open, COPY the descriptor into
+  the next free slot, update metadata, notify waiting consumers, return 1.
+  This function queues descriptors; validation belongs to hw_transfer.
+  The caller supplies non-NULL q/job pointers to queue operations.
+
+hw_pop(q, job):
+  While empty and still open, wait for work.
+  If a job exists, copy out the oldest descriptor, update metadata, notify
+  waiting producers, and return 1. This remains true after close.
+  Return 0 only when the queue is BOTH closed AND empty.
+
+hw_close(q):
+  Mark the queue closed. Wake ALL waiting producers AND consumers.
+  Calling close more than once is allowed and must be harmless.
+  Do not discard queued jobs. Do not wait for transfers to finish here.
+
+hw_queue_destroy(q):
+  Destroy initialized synchronization objects. The caller guarantees that
+  all threads using the queue have already been joined. Do not try to
+  destroy a queue while another thread is blocked on it.
+
+Use pthread_mutex_t and pthread_cond_t. Keep these exact member names/types:
+  pthread_mutex_t mutex;
+  pthread_cond_t not_empty;
+  pthread_cond_t not_full;
+
+All queue state must be inside its hw_queue object. Multiple independent
+queue objects must not interfere. The starter suggests a ring buffer, but
+you may change the remaining fields while preserving capacity and behavior.
+
+7. WORKER LOOP AND SAFE SHUTDOWN
+==============================
+
+hw_worker(arg):
+  Treat arg as hw_queue*.
+  Repeatedly pop a descriptor and execute hw_transfer on that private copy.
+  If a job is invalid, hw_transfer rejects it; continue processing later jobs.
+  Exit and return NULL when pop reports closed+empty.
+
+The queue mutex must NOT remain locked while executing a transfer. Another
+worker or producer must be able to use the queue while a device is slow.
+
+Typical caller lifecycle:
+  Initialize queue.
+  Start workers.
+  Start producers.
+  Join producers so all intended jobs have been submitted.
+  Close queue.
+  Join workers so all accepted jobs have completed.
+  Inspect destination buffers.
+  Destroy queue.
+
+Closing early is also defined: a producer that has not successfully queued
+its job must return 0 after observing close. Already accepted jobs drain.
+
+For operations racing with close, the mutex determines their order. A push
+that accepted its job before close can return 1; a push that observes closed
+must return 0. A successful push does NOT mean the transfer itself finished.
+
+FIFO describes removal order. With several workers, different jobs may
+finish in a different order. The tests do not assume global completion order.
+Callers must not submit overlapping destination buffers concurrently or
+modify sources while jobs are reading them. The queue does not create a
+buffer-ownership policy for arbitrary overlapping jobs.
+
+8. CONCURRENCY RULES
+===================
+
+Every shared queue flag, index, and count needs the appropriate mutex.
+Do not use volatile to replace synchronization. Do not implement polling
+loops, sleeps, sched_yield loops, or repeated trylock attempts as a wait.
+
+Use pthread_cond_wait with the queue mutex. Check the waiting condition in
+a WHILE loop, because a wakeup does not guarantee the condition is now true.
+Another thread may have taken the available job or slot before you reacquire
+the mutex. The wait operation releases the mutex while sleeping.
+
+Do not access an item through a queue slot after unlocking and allowing
+the slot to be reused. Copy the descriptor into the consumer's local object
+before releasing ownership of that slot.
+
+Do not hold the queue mutex while calling hw_transfer, hw_copy_unit, joining
+threads, or performing unrelated expensive work. Only queue bookkeeping
+belongs inside this critical section.
+
+The public tests are functional tests, not a proof that C data races are
+absent. Your implementation must be valid under the C/POSIX threading rules,
+even if an unsafe version happens to pass a particular execution.
+
+9. FIXED SCORING: 100 POINTS
+==========================
+
+A. Correctness: 60 points
+-------------------------
+Each suite earns 10 points only if the whole suite passes:
+
+  copy_modes   Sizes 1/2/4, all four increment modes, exact output region,
+               and exactly one copy-hook call per transfer.
+  validation   NULL, width, zero count, alignment, short buffers, overflow,
+               fixed-address capacities, and no writes on invalid jobs.
+  fifo         FIFO order, eight-slot fill/drain, ring wrap, descriptor copy,
+               repeated close, and operations after close.
+  closing      Multiple consumers waiting on an empty queue; multiple
+               producers waiting on a full queue; close wakes everyone;
+               accepted jobs remain available after close.
+  concurrent   Four producers plus four consumers; 2048 distinct jobs;
+               every ID received exactly once.
+  pipeline     Four producers plus four actual hw_worker threads; 2048
+               independent transfers; one invalid queued job skipped;
+               all results correct and all workers terminate.
+
+closing, concurrent, and pipeline each run five times in fresh processes.
+There is no partial credit within a suite. A crash, assertion failure, or
+20-second timeout fails that suite. Compilation failure yields total zero.
+
+B. Independent progress: 20 points
+----------------------------------
+Eligible only if ALL SIX correctness suites pass.
+
+The judge starts a worker on a transfer, then deliberately pauses its copy
+hook using a separate judge-owned condition variable. Before permitting
+that transfer to finish, the host must be able to:
+  enqueue another job;
+  dequeue it;
+  complete that unrelated transfer.
+
+Only after these steps does the judge release the paused first transfer.
+Both results must be correct. All steps passing earns 20 points; otherwise 0.
+
+This checks independent progress with an explicit dependency, not a fragile
+"finish within 2 milliseconds" benchmark. Keeping a queue lock held during
+the paused transfer prevents completion and hits the hang-detection timeout.
+There are no extra points for a faster CPU or more aggressive busy-waiting.
+
+C. Queue memory: 20 points
+--------------------------
+Eligible only if ALL SIX correctness suites pass.
+
+The trusted C judge computes these values with sizeof, not a student-reported
+number. Let:
+
+  Q = sizeof(hw_queue)
+      - sizeof(pthread_mutex_t) - 2*sizeof(pthread_cond_t)
+  S = 8 * sizeof(hw_job)
+  H = Q - S
+
+Q removes the three required platform-specific synchronization objects
+from the measured queue size. S is the capacity-eight descriptor storage
+on the same platform. H includes your remaining fields and layout padding.
+
+  Nonnegative overhead H       Points
+  H <= 64 bytes                 20
+  64 < H <= 128 bytes           12
+  128 < H <= 256 bytes           5
+  H > 256 bytes                 0
+
+A negative H earns 0 memory points: this exercise requires storage for
+eight full descriptors in the queue, not an external pointer array.
+
+No student-created heap allocation, variable-length arrays, mutable globals,
+static mutable locals, thread-local state, or external metadata are allowed.
+Ordinary bounded local variables and one local descriptor per worker are
+allowed. The memory score measures queue storage, not total process RAM.
+OS-managed pthread resources, caller-owned data buffers, and judge bookkeeping
+are excluded. Actual padding can vary by compiler; official grading uses
+one declared toolchain. The supplied layout fits the full-score tier on
+the toolchain used to validate this assignment.
+
+The no-hidden-storage and no-polling requirements are part of submission
+validity. An instructor must inspect source for them; this public functional
+grader is not a security sandbox or a complete static analyzer. A submission
+that violates these requirements is invalid, even if it prints a high score.
+
+Total = correctness + progress + memory. Passing mark: 60.
+The report has no subjective score component; it documents your reasoning.
+
+10. HOW TO BUILD AND GRADE
+=========================
+
+From this homework directory:
+
+  python grade.py
+  python grade.py --json > result.json
+
+Use python3 if that is your Python command. Requires Python 3.9+, a C11
+compiler, and POSIX thread support. Linux/WSL is recommended for the same
+environment as the original Section 2.3 demos. GCC with a compatible
+pthreads implementation can also run these tests on Windows.
+
+Select another compiler executable if necessary:
+
+  python grade.py --cc gcc
+  python grade.py --cc clang
+
+The grader compiles with -std=c11 -O2 -Wall -Wextra -pthread and writes its
+executable into build/. Run it only on code you trust: it executes native C.
+The 20-second limit detects hangs; elapsed time is not converted into points.
+
+Optional race diagnostics on a supported platform/toolchain:
+
+  python grade.py --cc clang --tsan
+
+This enables ThreadSanitizer and is a diagnostic run, not official scoring.
+Sanitizer availability varies; sanitizer overhead can cause timeouts. A
+sanitizer run without warnings is helpful evidence, not a complete proof.
+
+11. SUGGESTED DEVELOPMENT ORDER
+==============================
+
+1. Validate descriptors. Write down required source/destination byte counts.
+2. Implement synchronous transfer and verify all four increment modes.
+3. Implement queue initialization and FIFO operations for one caller.
+4. Add mutex protection and predicate-based condition-variable waits.
+5. Add close semantics, including waking both types of waiters.
+6. Implement hw_worker and check asynchronous pipeline completion.
+7. Audit which shared objects each lock protects and when buffers may be used.
+8. Measure queue memory and explain one concrete design tradeoff.
+
+Useful invariants to explain in your report:
+  queued-job count remains between 0 and 8;
+  a slot cannot be overwritten until its old descriptor has been removed;
+  no push accepted after close observes the closed state;
+  accepted jobs remain available until popped, even after close;
+  a descriptor's source/destination pointers do not imply buffer ownership;
+  no transfer runs while retaining the queue mutex.
+
+12. QUESTIONS YOUR REPORT MUST ANSWER
+====================================
+
+Why does volatile not make a queue thread-safe?
+Why is the condition-variable predicate checked in a loop?
+Why must close wake both producers and consumers?
+What is the difference between queue empty and all work complete?
+Why is it safe to reuse a descriptor object immediately after successful push,
+but unsafe to free its referenced buffers before transfer completion?
+How would the design change if jobs could write overlapping memory regions?
+Why does a fixed source require only size bytes rather than count*size?
+Why is waiting in hw_copy_unit a useful test of critical-section boundaries?
+
+Reference reading: ../tutorial.txt and the original critical-section/ and
+transfer-engine/ directories one level above this homework.
+
+13. PTHREAD AND MUTEX SYNTAX: PRACTICAL GUIDE
+===========================================
+
+13.1 Types, addresses, and member access
+--------------------------------------
+Include <pthread.h> to use these types and functions:
+
+  pthread_t worker;          // A handle identifying a thread.
+  pthread_mutex_t mutex;     // A mutual-exclusion lock object.
+  pthread_cond_t changed;    // An object threads can wait on for notification.
+
+Declaring a mutex or condition variable does not initialize it. Initialize
+before use. A pthread_t handle is filled by successful pthread_create;
+it is not a mutex and is not a portable integer thread number.
+
+If q is a pointer to a queue:
+
+  q->mutex       means (*q).mutex: the mutex inside that queue.
+  &q->mutex      means the address of that mutex.
+  q->qsize       would mean its count field, if you named that field qsize.
+
+The starter names its count field used. You may use a different name, but
+be consistent throughout your own implementation.
+
+Functions receive copies of their arguments, including pointer values:
+
+  job = &q->slots[index];    // Redirects only this function's local pointer.
+  *job = q->slots[index];    // Copies a descriptor into the caller's object.
+
+The second form is needed when returning a popped descriptor through hw_pop's
+output parameter. The descriptor copy includes pointer values, not copies
+of the buffers they point to. Copy before unlocking and reusing the slot.
+
+13.2 Initialize and destroy synchronization objects
+--------------------------------------------------
+  int rc = pthread_mutex_init(&q->mutex, NULL);
+  int rc = pthread_cond_init(&q->not_empty, NULL);
+
+These are separate example calls, not declarations to paste into one scope
+with the same variable name. NULL requests default attributes. Each returns
+zero on success or a nonzero error number. Unlike many system calls, these
+functions return the error number directly; do not assume errno holds it.
+
+Initialize the mutex and both condition variables. On a later initialization
+failure, destroy objects that were already successfully initialized. Do not
+destroy the object whose initialization failed or one not yet initialized.
+
+For standalone objects, these are alternative initialization forms:
+
+  pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t event = PTHREAD_COND_INITIALIZER;
+
+Do not reinitialize an already active object, copy initialized synchronization
+objects with assignment/memcpy, or zero them with memset after initialization.
+
+After all users have finished:
+
+  pthread_cond_destroy(&q->not_empty);
+  pthread_cond_destroy(&q->not_full);
+  pthread_mutex_destroy(&q->mutex);
+
+Destroy does not close the queue, wake threads, or join workers for you.
+
+13.3 Locking is an ordinary function call
+----------------------------------------
+  pthread_mutex_lock(&q->mutex);
+  /* Read/check/update shared queue fields here. */
+  pthread_mutex_unlock(&q->mutex);
+
+Do not write pthread_mutex_lock(...) { ... }. It is not an if statement,
+and leaving a C block does not automatically unlock the mutex.
+
+Successful lock acquisition gives this thread ownership. Another thread
+trying to acquire the same mutex waits. A mutex does not physically block
+unprotected reads or writes: ALL participating accesses must follow the
+locking rule. Reading an ordinary field while another thread writes it
+without synchronization is also a data race.
+
+Keep each logical queue operation together: checking state, changing a
+slot, and updating indices/count must not expose a partially updated queue.
+On every return path after successful lock acquisition, release the lock.
+Do not lock an ordinary mutex twice in the same thread or unlock a mutex
+owned by another thread.
+
+13.4 A condition variable is not a Boolean condition
+---------------------------------------------------
+Your count tells you whether jobs exist. not_empty lets a consumer SLEEP
+until it should check again. The name not_empty does not inspect the queue.
+Changing the count alone does not wake a waiting thread.
+
+General waiting pattern (adapt the predicate to your function):
+
+  pthread_mutex_lock(&q->mutex);
+  while (/* work cannot proceed, and shutdown does not permit exit */) {
+      pthread_cond_wait(&q->not_empty, &q->mutex);
+  }
+  /* The mutex is owned here again. Inspect state and decide what to do. */
+  pthread_mutex_unlock(&q->mutex);
+
+pthread_cond_wait requires the calling thread to own the mutex. It releases
+that mutex and begins waiting atomically with respect to the normal
+predicate/notification protocol. Before returning successfully, it reacquires
+the mutex. This allows another thread to change the queue while you sleep.
+
+Use WHILE, not IF. Wakeups can be spurious, and another consumer might take
+the available job before this thread reacquires the mutex. A notification
+means "check again", not "a slot or job is reserved specifically for you".
+
+For this homework, use the same queue mutex for both condition variables.
+Do not replace the wait with sleep(), spinning, or a loop reading the count.
+
+13.5 Signal versus broadcast
+----------------------------
+  pthread_cond_signal(&q->not_empty);
+  pthread_cond_broadcast(&q->not_empty);
+
+signal wakes at least one current waiter if there are any; broadcast wakes
+all current waiters. They still have to acquire the mutex before continuing,
+so broadcasting does not let everyone edit queue state at the same time.
+Notifications are not stored as tickets for future waiters. The predicate
+is the persistent state; always check it before deciding to wait.
+
+Use this mapping:
+
+  Added one job       -> signal not_empty (a consumer can proceed).
+  Removed one job     -> signal not_full (a producer can proceed).
+  Closed the queue    -> broadcast BOTH (everyone must check shutdown).
+
+In this assignment, update state and notify while holding the queue mutex,
+then unlock. A thread notified while you own the mutex cannot finish its
+wait until that mutex becomes available.
+
+After close, producers reject new jobs. Consumers keep draining accepted
+jobs and exit only when the queue is closed AND empty. Closing does not
+cancel an in-progress copy and does not itself prove all work has finished.
+
+13.6 Starting a thread
+----------------------
+  void *worker_function(void *arg) {
+      hw_queue *queue = arg;
+      /* Use queue according to the assignment contract. */
+      return NULL;
+  }
+
+  pthread_t thread;
+  int rc = pthread_create(&thread, NULL, worker_function, &queue_object);
+
+Arguments to pthread_create:
+  &thread           Where the new thread handle will be stored.
+  NULL              Default thread attributes.
+  worker_function   Function to execute; pass its name, not a call to it.
+  &queue_object     Pointer passed to that function as arg.
+
+The new worker and the caller may run concurrently. Do not assume which
+one runs first. The object passed as arg must remain alive while the worker
+uses it. Never reuse one changing loop-variable address as several threads'
+independent arguments unless an explicit synchronization protocol makes it safe.
+
+13.7 Joining and destruction order
+----------------------------------
+  int rc = pthread_join(thread, NULL);
+
+This waits for that joinable thread to terminate. NULL means you do not
+need its returned pointer. A successful join establishes completion and
+visibility of the finished thread's writes for the joining thread. It does
+not repair data races that occurred earlier.
+
+Join only successfully created threads, check success, and do not join the
+same thread twice. The caller owns handles and must arrange this lifecycle:
+
+  initialize -> start workers/producers -> join producers -> close queue
+  -> join workers -> use final results -> destroy queue
+
+The queue can be empty while a worker is still executing a job it removed.
+Neither count==0 nor closed==true is a substitute for joining workers.
+
+13.8 Portable byte pointers and overflow checks
+-----------------------------------------------
+For byte offsets, use:
+
+  const unsigned char *src = job->src;
+  unsigned char *dst = job->dst;
+  /* src + offset and dst + offset now advance by offset bytes. */
+
+Standard C does not define arithmetic on void pointers. uintptr_t is an
+integer type useful for the assignment's address-alignment check; it is not
+the pointer type expected by hw_copy_unit. Include <stdint.h> explicitly
+when using uintptr_t or SIZE_MAX, rather than relying on another header.
+
+For nonzero size, check multiplication BEFORE evaluating it:
+
+  if (job->count > SIZE_MAX / job->size) {
+      return -1;
+  }
+
+Using 1LL does not guarantee a wider type than size_t. An overflowed product
+cannot reliably tell you whether the original mathematical product was too big.
+
+13.9 Quick debugging checklist
+-------------------------------
+  Are all synchronization objects initialized before use?
+  Are all shared queue reads AND writes protected?
+  Does each wait use a loop and account for closure?
+  Does each successful push/pop return 1?
+  Does pop copy into *job, rather than redirect a local pointer?
+  Does each early return release the mutex?
+  Are transfers executed after releasing the queue mutex?
+  Does close notify both kinds of waiters?
+  Are all threads joined before destroy?
+
+These snippets explain syntax and ownership. They intentionally do not
+provide a complete homework solution.

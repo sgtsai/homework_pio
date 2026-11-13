@@ -1,4 +1,17 @@
-# Section 2.2: Bitstream Packet Processor
+# Systems Programming Homework: Sections 2.2 and 2.3
+
+- **Section 2.2:** [Bitstream Packet Processor](homework.txt), in this repository's root directory.
+- **Section 2.3:** [Safe Asynchronous Transfer Queue](section2-3/homework/homework.txt), with its own incomplete C starter and grader.
+- **Pthread syntax guide:** Section 13 of the [Section 2.3 assignment](section2-3/homework/homework.txt) explains mutexes, condition variables, notifications, thread creation/joining, and pointer pitfalls.
+
+To run Section 2.3:
+
+```sh
+cd section2-3/homework
+python grade.py
+```
+
+## Section 2.2: Bitstream Packet Processor
 
 Read [homework.txt](homework.txt) for the complete assignment, machine specification, examples, and fixed grading rubric.
 

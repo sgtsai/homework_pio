@@ -1,0 +1,819 @@
+SECTION 2.3 DETAILED TUTORIAL
+Threads, Critical Sections, and Asynchronous Transfer Engines
+============================================================
+
+Scope
+-----
+This guide explains the actual files in section2-3:
+
+  critical-section/main.c   Shared counter and three locking strategies.
+  transfer-engine/engine.h  Transfer engine's public interface.
+  transfer-engine/engine.c  Thread-based implementation of that interface.
+  transfer-engine/main.c    Copy, fill, and incorrect-count examples.
+  Makefile                 Build and run commands.
+
+No development board is required. The transfer engine is a software model
+of a DMA-like interface, not an actual hardware DMA controller.
+
+Read Sections 1-7 first for threading, then Sections 8-15 for transfers.
+Sections 16-19 connect the ideas and provide exercises and revision notes.
+This guide explains the existing code without modifying it. Some details
+in the demo comments and README are simplified or unsafe; Section 7 and
+Section 14 identify them explicitly so they are not learned as best practice.
+
+
+1. PROCESSES, THREADS, CONCURRENCY, AND PARALLELISM
+=================================================
+
+A process is a running program with its own virtual address space and
+resources. A thread is an execution sequence within a process. Threads
+normally share global variables and heap allocations, but each has its
+own execution context and stack.
+
+Consequences for this demo:
+  counter and sink are static globals, so both worker threads access the
+  same objects. An ordinary local variable such as a worker's loop index
+  belongs to that invocation and is not automatically shared.
+
+Concurrency means work can overlap in time. On one CPU, the scheduler can
+pause thread A, execute thread B, then resume A. Parallelism means two
+threads execute simultaneously on different CPU execution resources.
+
+You do not need multiple cores to have a concurrency bug. A preemption
+between reading and writing a shared variable is enough to lose an update.
+Multiple cores often make the problem easier to observe, but one core does
+not make unsynchronized shared access safe.
+
+The demo's usable_cpus() checks Linux CPU affinity where possible. This
+matters because a machine may have many CPUs while a container or process
+is allowed to run on only a subset. The fallback asks how many processors
+are online, which is not necessarily the same as the process's allowed set.
+
+
+2. THREAD CREATION, COMPLETION, AND JOIN
+=======================================
+
+The important pthread operations are:
+
+  pthread_create(...)
+    Start a thread executing a function. The caller continues separately.
+
+  pthread_join(thread, ...)
+    Wait for that joinable thread to terminate and collect its completion.
+    A successful join also provides the synchronization needed for the
+    joining thread to observe the completed thread's ordinary memory writes.
+
+In critical-section/main.c, run() does the following:
+
+  reset counter -> record start time -> create two workers
+  -> join both workers -> record finish time
+
+The joins are why main waits until both workers finish before reporting.
+However, joining afterward does not repair a data race that already took
+place between the workers while they were running.
+
+Thread functions here have the form:
+
+  static void *worker(void *arg)
+
+The pointer parameter can identify per-thread state. The returned pointer
+can be collected by pthread_join, though the demos return NULL.
+
+Production code should check pthread return values. If creation fails,
+there is no successfully started worker to join. The demos omit much of
+this error handling to keep their main concepts short.
+
+
+3. WHY counter++ NEEDS SYNCHRONIZATION
+=====================================
+
+There are two workers, and each performs 20,000 increments:
+
+  expected total = 2 * 20,000 = 40,000
+
+An increment is conceptually a read-modify-write operation:
+
+  read old counter -> compute old counter + 1 -> write result
+
+The unlocked worker makes this structure visible:
+
+  long v = counter;
+  counter = v + 1;
+
+An illustrative lost-update interleaving is:
+
+  Step   Worker A                  Worker B              counter
+  ----   ------------------------  --------------------  -------
+  1      reads 10                                        10
+  2                                reads 10              10
+  3      computes 11                                     10
+  4                                computes 11           10
+  5      writes 11                                       11
+  6                                writes 11             11
+
+Two increments were attempted, but the counter increased only once.
+
+This table is an explanation of a common observed failure, not the complete
+C language guarantee. Conflicting unsynchronized accesses to the same
+non-atomic object, with at least one write, form a C data race. Such a race
+causes undefined behavior. The result is not formally restricted to a
+smaller count, and even a correct-looking result does not prove safety.
+
+Do not infer atomicity from short source code or a single machine
+instruction. Atomicity and synchronization must come from the language or
+platform mechanisms that explicitly provide them.
+
+
+4. CRITICAL SECTIONS AND LOCKS
+==============================
+
+A critical section is a region accessing shared state that must obey a
+mutual-exclusion rule. A lock lets only one participating thread enter
+that region at a time.
+
+The intended counter protection is:
+
+  pthread_spin_lock(&lock);
+  counter++;
+  pthread_spin_unlock(&lock);
+
+If every competing access to counter follows this protocol, one worker
+finishes its read-modify-write before another worker starts its own.
+The lock also provides ordering and visibility between lock participants;
+it is not merely a polite request to the operating system.
+
+The whole update must be protected. This arrangement is insufficient:
+
+  long v = counter;          // read outside the lock: unsafe
+  lock();
+  counter = v + 1;
+  unlock();
+
+Both workers may already have read the same old value before either locks.
+Likewise, protecting only writers is insufficient if readers access the
+same ordinary object concurrently without the required synchronization.
+
+Think in terms of an invariant: a condition that must remain consistent.
+For example, updating both a queue's length and its tail pointer may need
+one critical section even though they are separate assignments.
+
+The right rule is: keep a critical section as short as possible WHILE
+preserving the complete shared-state invariant.
+
+
+5. SHORT LOCK HOLD VERSUS LONG LOCK HOLD
+=======================================
+
+work(i) performs 2,000 iterations of a numerical recurrence. Its purpose
+is to consume CPU time so that the placement of expensive work is visible.
+The numerical result is not the main lesson.
+
+Intended short-hold design:
+
+  do independent computation
+  acquire lock
+  update shared counter
+  release lock
+
+Intended long-hold design:
+
+  acquire lock
+  do expensive computation
+  update shared counter
+  release lock
+
+In the second design, a worker prevents others from proceeding throughout
+the expensive computation. That serializes work that could otherwise overlap.
+
+If each iteration contains W units of independent work and L units of
+locked work, a rough lower-bound model for two workers doing R iterations is:
+
+  independent work with two useful CPUs: about R*W
+  serialized locked work:                at least 2*R*L
+
+These are explanatory terms, not a precise timing formula. Scheduling,
+lock contention, cache traffic, compiler optimization, and other workload
+all affect real measurements. A longer critical section is not guaranteed
+to make this particular demo exactly twice as slow on every machine.
+
+Another design can reduce sharing: each worker computes a private partial
+count, then main combines those counts after joining. This is appropriate
+when other threads do not need the counter's intermediate values.
+
+
+6. SPINLOCKS, MUTEXES, ATOMICS, AND volatile
+===========================================
+
+Spinlock:
+  A waiting thread actively retries acquisition. It can waste CPU time
+  while another thread owns the lock. The demo uses pthread_spinlock_t.
+
+Mutex:
+  A mutex implementation can block a waiting thread rather than continually
+  consume execution time. It is usually a more natural choice for ordinary
+  application code with potentially long waits. Implementations may also
+  spin briefly as an optimization.
+
+Atomic operation:
+  An operation explicitly guaranteed to be indivisible under the relevant
+  memory model. C11 supplies atomic types and operations in <stdatomic.h>.
+
+For a counter that only needs an accurate final numerical total, an
+illustrative replacement is:
+
+  #include <stdatomic.h>
+  static atomic_long counter;
+
+  atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed);
+
+Relaxed ordering can suffice for this independent numerical counter, but
+it does not publish other data or make a multi-object invariant atomic.
+An atomic counter and a lock protecting a whole data structure solve
+different problems. Atomic implementations are not all necessarily lock-free.
+
+volatile:
+  A qualifier used for accesses that the implementation must treat as
+  observable in specified ways, often in hardware-facing code. It does NOT
+  make counter++ atomic, create mutual exclusion, or establish inter-thread
+  synchronization. Do not use it as a substitute for locks or atomics.
+
+Deadlock and starvation:
+  Deadlock means participants cannot proceed because they are waiting on
+  conditions that cannot be satisfied, such as two locks acquired in
+  opposite orders. Starvation means a particular participant keeps missing
+  its opportunity to proceed. Locking does not automatically guarantee fairness.
+
+Avoid holding a spinlock across sleeping, blocking I/O, or waiting for a
+thread that may need the same lock. On one CPU, spinning can delay the
+very lock owner whose progress is needed.
+
+
+7. IMPORTANT LIMITATIONS IN THE CRITICAL-SECTION DEMO
+=====================================================
+
+The intended lesson is valid, but the current file is not a fully safe
+example of C threading. Read the following before treating its output
+or timing as a correctness proof.
+
+7.1 The deliberately unlocked counter has undefined behavior
+-----------------------------------------------------------
+The first worker races on counter. The README's suggestion that its count
+is always smaller is too strong: the language makes no such promise.
+An occasional value of 40,000 does not establish correctness.
+
+7.2 sink is another shared variable
+----------------------------------
+Both worker_unlocked() and worker_locked() execute:
+
+  sink += work(i);
+
+outside a lock. sink is a shared non-atomic static uint32_t, so these
+updates introduce another data race. Therefore the short-lock version
+protects counter, but the complete program still has undefined behavior
+because of sink. It should not be described as fully race-free as written.
+
+The long-lock worker performs the sink update under the same lock, so
+that worker's accesses are protected. This does not rescue an execution
+that has already run the earlier racy demonstrations.
+
+7.3 The optimization-prevention comment is insufficient
+------------------------------------------------------
+The file says sink keeps work() from being deleted. But sink is not read
+to produce an observable result, and it is not itself volatile or atomic.
+An optimizing compiler may remove dead computations. Actual generated code
+must be inspected before assuming the artificial workload is retained.
+
+A better teaching design would accumulate into a separate result for each
+worker, join all workers, then combine and print those results. Each worker
+writes its own slot, and main reads only after joining. This avoids the
+shared sink race and makes the numerical work observable without putting
+unrelated computation inside the counter's lock.
+
+7.4 Portability
+---------------
+The program uses POSIX interfaces. pthread_spinlock_t is not available on
+every platform; notably, native macOS does not supply the POSIX spinlock
+API used here. The README's broad macOS claim needs this qualification.
+Linux through WSL or the repository's Linux container is the clearest
+environment for running these exact files unchanged.
+
+
+8. WHAT A TRANSFER ENGINE REPRESENTS
+====================================
+
+Normally, software might copy an array itself:
+
+  for (size_t i = 0; i < N; ++i)
+      dst[i] = src[i];
+
+With a transfer engine, software describes the operation and starts another
+execution unit. That unit carries out the repeated memory accesses.
+
+The basic lifecycle is:
+
+  claim -> configure -> start -> wait for completion -> use results -> release
+
+Configuration describes WHAT to transfer. Starting schedules the work.
+Completion tells you WHEN the destination can be consumed safely.
+
+Real DMA means Direct Memory Access: hardware performs transfers without
+the CPU executing a load/store copy loop for every element. DMA still
+uses memory/interconnect bandwidth, can contend with the CPU, and needs
+configuration and completion handling. It is not zero-cost work.
+
+This demo uses pthread_create and memcpy inside a worker. The transfer
+therefore still consumes host CPU execution time. It demonstrates the
+interface and asynchronous control flow, not hardware offload performance.
+
+
+9. THE JOB DESCRIPTOR: EVERY FIELD MATTERS
+=========================================
+
+engine_job_t contains:
+
+  src             source address
+  dst             destination address
+  count           number of transfers
+  size            bytes per transfer: 1, 2, or 4
+  src_increment   whether source advances after each transfer
+  dst_increment   whether destination advances after each transfer
+
+XFER_8, XFER_16, and XFER_32 refer to bit widths, but their enum values
+are byte sizes 1, 2, and 4. Keep those two units distinct.
+
+Core dimensional equation:
+
+  total bytes transferred = count * size
+
+For N = 4096 with XFER_32:
+
+  4096 transfers * 4 bytes/transfer = 16384 bytes
+
+count = 16384 would instead request:
+
+  16384 transfers * 4 bytes/transfer = 65536 bytes
+
+A useful review habit is to write the units beside each expression.
+sizeof(array) is a byte count. It is not automatically the correct
+transfer count for an engine configured to move multi-byte items.
+
+The engine copies the descriptor struct in engine_configure:
+
+  chans[ch].job = *job;
+
+This copies the pointer values and settings. It does NOT duplicate the
+source contents or allocate destination storage. Buffer lifetime and
+ownership remain the caller's responsibility.
+
+
+10. ADDRESS INCREMENT MODES
+===========================
+
+Let S be the initial source address, D the initial destination address,
+B the transfer size, and i the zero-based transfer number.
+
+  source(i)      = S + (src_increment ? i*B : 0)
+  destination(i) = D + (dst_increment ? i*B : 0)
+
+Both increment:
+  S -> D, S+B -> D+B, S+2B -> D+2B, ...
+  Ordinary sequential copying.
+
+Source fixed, destination increments:
+  S -> D, S -> D+B, S -> D+2B, ...
+  Repeat one source item into consecutive destination items: filling.
+
+Source increments, destination fixed:
+  S -> D, S+B -> D, S+2B -> D, ...
+  With ordinary RAM, each write replaces the previous item at D, so the
+  last transferred item remains. A real peripheral FIFO register can have
+  different side effects: repeated writes may enqueue successive items.
+
+Neither increments:
+  Repeatedly read the same source and write the same destination.
+  For ordinary stable RAM this does not fill an array.
+
+Concrete byte-address example: S=0x1000, D=0x2000, B=4, count=3.
+
+  Transfer   Both increment        Fixed source
+  0          0x1000 -> 0x2000      0x1000 -> 0x2000
+  1          0x1004 -> 0x2004      0x1000 -> 0x2004
+  2          0x1008 -> 0x2008      0x1000 -> 0x2008
+
+The implementation casts pointers to unsigned char pointers so pointer
+increments are measured in bytes. Adding step=4 to a uint32_t pointer
+would advance by four uint32_t objects, normally 16 bytes, not four bytes.
+
+
+11. ALIGNMENT, BOUNDS, AND BUFFER LIFETIME
+========================================
+
+Alignment
+---------
+This engine requires each initial address to be a multiple of size:
+
+  address % size == 0
+
+For a four-byte transfer, 0x1000 and 0x1004 are aligned; 0x1002 is not.
+For a two-byte transfer, 0x1002 is aligned. One-byte transfers need no
+additional alignment beyond valid byte-addressable storage.
+
+These are rules enforced by the teaching interface even though its internal
+memcpy can handle byte addresses. Real hardware has its own alignment rules.
+
+Bounds
+------
+For an incrementing side, the backing buffer needs count*size accessible
+bytes. For a fixed side, it needs at least size accessible bytes at that
+fixed address. Capacity calculations must also avoid size_t multiplication
+overflow. Before computing count*size, one can check count <= SIZE_MAX/size.
+
+An aligned address is not necessarily valid or large enough. The engine
+checks alignment, width, and nonzero count, but it does not know allocation
+sizes and cannot establish that buffers are in bounds. It also does not
+provide a general valid-pointer check.
+
+Source/destination overlap is not supported as a general memmove operation.
+The implementation performs memcpy on each item, and repeated transfers
+can overwrite data needed by a later transfer. Use distinct buffers for
+these demos unless a particular case has been explicitly analyzed.
+
+Lifetime and ownership
+----------------------
+Both source and destination must remain valid until completion. Do not
+free a heap buffer, return from a function owning a needed stack object,
+or reuse the destination while a transfer still accesses it.
+
+The fill example uses the address of a local uint32_t pattern. It is safe
+with respect to lifetime because main remains active and waits for the
+transfer before that object leaves scope. The source should remain stable
+throughout the fill; const void * does not stop another thread from writing
+to the underlying object through another pointer.
+
+Likewise, avoid reading the destination while the worker writes it. In this
+thread-based model, concurrent unsynchronized reads/writes can be C data
+races, not merely reads of a partially completed array.
+
+
+12. WALKTHROUGH OF THE COPY AND FILL DEMOS
+=========================================
+
+12.1 Copy
+---------
+reset() fills src with a reproducible pattern and clears dst.
+The copy descriptor uses count=N, size=4, and both increment flags true.
+engine_start() marks the channel busy and creates the worker thread.
+
+The main thread then repeatedly calls engine_busy(). It increments spins
+while it waits and occasionally calls sched_yield(). The expression
+
+  (spins & 0xffff) == 0
+
+tests whether the low 16 bits are all zero, so the yield happens at those
+counter values, every 65,536 increments before wraparound.
+
+sched_yield() is a scheduling request, not a completion notification or
+memory synchronization primitive. The spin counter measures how many loop
+iterations happened on that run; it is not useful transfer throughput.
+
+After polling, main still calls engine_wait(), then compares the first
+N*sizeof(uint32_t) bytes using memcmp. Equality is indicated by return zero.
+
+12.2 Fill
+---------
+The pattern is 0xA5A5A5A5. The source points at that one word, source
+increment is false, and destination increment is true. Each transfer reads
+the same pattern and writes the next destination word.
+
+For a less repetitive pattern such as 0x12345678, fixed-source four-byte
+transfers still repeat the whole word. Calling memset(dst, 0x12345678, ...)
+would instead repeat a byte derived from the argument, not the whole word.
+
+This time main calls engine_wait() directly rather than counting spins.
+After completion it checks every intended destination word against pattern.
+
+12.3 Worker implementation
+-------------------------
+For each transfer, run_job():
+
+  copies size bytes with memcpy
+  optionally advances source
+  optionally advances destination
+  calls nanosleep with a requested delay of 2,000 nanoseconds
+
+2,000 nanoseconds is 2 microseconds. Actual sleep duration is affected by
+scheduling and timer resolution, and a sleep may be interrupted. Do not
+infer a precise 4096*2-microsecond runtime from this source code.
+
+
+13. THE --mistake EXAMPLE: UNITS WITHOUT A CRASH
+==============================================
+
+The program deliberately allocates four times the intended number of words:
+
+  N = 4096 words
+  ROOM = 4*N = 16384 words per array
+
+Normal operation uses only the first N words. The mistake sets:
+
+  wrong.count = N * sizeof(uint32_t)
+
+On the intended platform sizeof(uint32_t)=4 bytes, so this asks for
+16384 transfers of four bytes, or 16384 words, not 4096 words.
+
+The extra written region is:
+
+  16384 - 4096 = 12288 words
+  12288 * 4 = 49152 extra bytes
+
+The operation exceeds the INTENDED region but remains inside the enlarged
+demo allocation. This is deliberate: it exposes the mistake without using
+an actual out-of-bounds write for this specific scenario.
+
+On an array allocated with only N words, the same descriptor would write
+outside the allocation. The interface cannot infer what size you intended.
+
+The reporting loop records the index after the last nonzero destination
+word. It is not a general byte-accurate write detector: writing zero into
+an initially zero location is invisible. For the demo's chosen source
+pattern, later nonzero values make the intended result visible.
+
+
+14. CHANNEL OWNERSHIP AND ENGINE IMPLEMENTATION LIMITATIONS
+==========================================================
+
+There are four channels. engine_claim() returns an unused index or -1.
+Each channel holds its own descriptor, flags, and pthread handle.
+
+Recommended caller sequence for this implementation:
+
+  claim -> check success -> configure -> start -> wait
+  -> inspect/use results -> optionally configure/start/wait again -> release
+
+Always wait after each successful start, even if polling says busy is false.
+Joining and transfer completion are related but different responsibilities.
+
+14.1 volatile busy is not a safe thread communication mechanism
+--------------------------------------------------------------
+The channel declares volatile bool busy. The worker writes false and the
+host reads it without a lock or atomic operation. That is a C data race.
+volatile does not make the polling protocol safe.
+
+A robust implementation could use atomic_bool, storing completion with
+release semantics and reading it with acquire semantics, together with a
+well-defined thread lifecycle. Alternatively it could protect state with
+a mutex and signal completion with a condition variable.
+
+A condition-variable waiter checks a predicate in a loop while holding
+the associated mutex. The wait releases the mutex while sleeping and
+reacquires it before returning. The loop is needed because waking does not
+by itself establish that the desired predicate is true.
+
+The existing engine_wait() uses pthread_join, which is the meaningful
+completion synchronization for worker writes. However, its preliminary
+read of busy also participates in the unsafe flag protocol. Simply
+joining eventually does not make earlier races acceptable.
+
+14.2 Completion does not automatically reclaim thread resources
+---------------------------------------------------------------
+A terminated joinable thread still needs to be joined or detached.
+This engine's engine_release() checks busy but does not join the thread.
+Releasing or starting again without first waiting can lose an unjoined
+thread handle. Follow the demonstrated start -> wait -> reuse/release order.
+
+The implementation treats a zero pthread_t as a missing handle. pthread_t
+is an opaque POSIX type, and zero is not a portable validity convention.
+A separate explicit started/joinable flag would express that state better.
+
+14.3 Channel allocation is not protected against multiple callers
+----------------------------------------------------------------
+engine_claim() scans and writes shared claimed flags without a lock.
+Two simultaneous callers could both choose the same channel. The example
+uses one host caller, so do not generalize the API into a thread-safe
+allocator without adding synchronization.
+
+14.4 Error handling is intentionally incomplete
+-----------------------------------------------
+The implementation aborts on several invalid configurations but does not
+check pthread_create's return value. If creation fails after busy is set,
+the channel can appear permanently busy without a worker to finish it.
+Production code needs failure recovery and explicit lifecycle state.
+
+The teaching code's comments also overstate real hardware's lack of cost.
+Real DMA avoids per-element CPU copying, but setup, synchronization,
+bandwidth contention, and completion handling still have costs.
+
+
+15. REAL DMA: USEFUL EXTENSIONS TO THE MODEL
+===========================================
+
+Polling versus interrupt-driven completion:
+  Polling checks status repeatedly and consumes time. An interrupt-driven
+  design lets software respond to completion without continually checking.
+  Exact mechanisms depend on the hardware and operating system.
+
+Peripheral pacing:
+  A real peripheral may request transfers only when its FIFO can accept
+  or supply an item. A descriptor's count does not mean every transfer
+  can happen immediately. The software demo has no real peripheral request
+  handshake; its sleep is only an artificial delay.
+
+Cache coherency:
+  On systems where CPU caches and DMA accesses are not automatically
+  coherent, the platform's DMA API may require cache maintenance and
+  ownership transitions. CPU virtual addresses are not universally usable
+  as DMA bus addresses. This demo's ordinary pointers do not model that.
+
+Bandwidth and latency:
+  Larger transfers can amortize setup overhead. Small transfers may not
+  benefit once configuration and completion costs are included. Independent
+  CPU work can overlap with transfers, but both may contend for memory.
+
+Double buffering:
+  The engine fills buffer A while the CPU processes completed buffer B.
+  When A completes and B is no longer in use, swap roles. Correct ownership
+  transitions are essential: neither side may overwrite a buffer the other
+  still needs. Extra buffering improves overlap, not correctness by itself.
+
+
+16. HOW SECTION 2.3 CONNECTS TO SECTION 2.2
+==========================================
+
+Section 2.2 taught you to interpret data and move it through a small pipeline.
+Section 2.3 adds concurrent access, lifetime, and resource ownership.
+
+PIO analogy:
+  A PIO state machine, CPU, and transfer engine can be independent actors.
+  FIFO capacity and transfer requests determine when data can move.
+  A CPU must not assume that starting an operation means its result exists.
+
+Bitfield analogy:
+  Control settings often use bitfields, so masking and shifting still
+  matter. But correctly computing control bits does not solve races or
+  establish when a transfer is finished.
+
+Shared-state analogy:
+  Your Section 2.2 rolling checksum belonged to one sequential state
+  machine. If multiple CPU threads update one checksum, that state now
+  needs an explicit ownership or synchronization policy. Even if individual
+  updates are protected, the order of packets may matter to the checksum.
+
+Common reasoning method:
+  Identify the state, its owner, the operation that changes it, and the
+  event that makes that change visible to the next consumer.
+
+
+17. BUILDING, OBSERVING, AND MEASURING
+======================================
+
+From section2-3 in a suitable Linux environment:
+
+  make
+  make run
+  make run-critical-section
+  make run-transfer-engine
+  make mistake
+
+The Makefile normally uses -O2 -Wall -Wextra -pthread. The -pthread option
+selects the toolchain's threading support for compilation and linking.
+Executables are placed in bin/.
+
+The critical-section timer uses CLOCK_MONOTONIC, which is appropriate for
+elapsed intervals rather than calendar time. Its interval includes worker
+creation, execution, synchronization, and joining, not just counter updates.
+
+Useful experiment questions:
+  Do repeated runs vary? Are the CPUs available to the process restricted?
+  Does more lock-held work increase contention?
+  Does polling spend CPU time that a blocking wait could avoid?
+  Does the wrong count produce the predicted fourfold transfer volume?
+
+Do not treat a particular timing ratio or a correct final count as proof
+of thread safety. Fix the documented races before using the demos for
+rigorous performance comparisons. Race detectors such as ThreadSanitizer
+can help on supported toolchains, but a clean test run is not a universal
+proof and sanitizer overhead changes timings.
+
+This tutorial was checked against the source files. No native execution,
+hardware DMA experiment, or sanitizer run is claimed as part of creating
+this document. All numerical timings in the README are examples, not
+measurements guaranteed for your machine.
+
+
+18. PRACTICE QUESTIONS WITH ANSWERS
+===================================
+
+Q1. Two workers each increment a counter 20,000 times. What is the intended
+    total, and does observing it prove the unlocked program is safe?
+A1. 40,000. No: a racy execution can happen to print the expected value.
+
+Q2. Why must a lock cover both reading and writing the counter?
+A2. Otherwise two workers can read the same old value before either writes.
+    Serializing only the writes does not prevent the lost update.
+
+Q3. Does one CPU eliminate races?
+A3. No. Threads can be preempted between related operations on one CPU.
+
+Q4. Does volatile make the busy flag a safe completion signal?
+A4. No. Use proper synchronization, such as an atomic protocol or a
+    mutex/condition variable, and manage joining separately.
+
+Q5. Is the current short-lock worker fully race-free?
+A5. No. Its counter is protected, but sink += work(i) remains a shared
+    unsynchronized update outside the lock.
+
+Q6. How many bytes do 300 XFER_16 transfers move?
+A6. 300 * 2 = 600 bytes.
+
+Q7. You want to copy 2048 bytes using XFER_32. What count do you use?
+A7. 2048 / 4 = 512 transfers, assuming valid aligned buffers of sufficient
+    capacity. A length not divisible by four would require separate handling.
+
+Q8. Which increment flags fill an array with one uint32_t pattern?
+A8. Source increment false, destination increment true, size XFER_32,
+    count equal to the intended number of destination words.
+
+Q9. Does copying the job descriptor preserve the source buffer contents?
+A9. No. It copies the pointer, not the pointed-to data. Keep the source
+    valid and stable until the transfer is complete.
+
+Q10. Can you use dst immediately after engine_start returns?
+A10. No. Starting is not completion. Wait through the supported completion
+     mechanism before consuming the destination.
+
+Q11. Why call engine_wait after polling reports not busy?
+A11. To join the worker, establish completion synchronization, and collect
+     joinable-thread resources. The existing volatile polling itself still
+     needs correction for a safe implementation.
+
+Q12. Is a four-byte-aligned address sufficient to make a transfer valid?
+A12. No. It also needs valid accessible storage of adequate size, correct
+     ownership and lifetime, and a valid transfer configuration.
+
+Q13. What happens when both increment flags are false on ordinary RAM?
+A13. The engine repeatedly copies the same source item to the same
+     destination address. It does not fill consecutive array elements.
+
+Q14. Why does make mistake not intentionally crash from an array overrun?
+A14. Arrays contain ROOM=4*N words. The wrong count uses that enlarged
+     allocation, exceeding the intended N-word region but not the allocation.
+
+Q15. Is the main thread's spin count a measure of bytes per second?
+A15. No. It counts polling-loop iterations and depends on scheduling,
+     CPU speed, compiler behavior, and the worker's artificial delay.
+
+Q16. Does true DMA consume no system resources?
+A16. No. It uses transfer hardware and memory/interconnect bandwidth, with
+     CPU overhead for setup and completion handling as applicable.
+
+Q17. Why can a long-held spinlock be particularly inefficient?
+A17. Waiting threads spend CPU time retrying instead of doing useful work,
+     while the owner serializes work inside the critical section.
+
+Q18. When can per-thread partial counters replace a shared counter?
+A18. When the application can combine results after workers finish and
+     does not need each intermediate increment to be globally visible.
+
+
+19. FINAL REVISION CHECKLIST
+============================
+
+  Threads share ordinary globals; their execution order is not guaranteed.
+  Read-modify-write needs an appropriate atomicity/synchronization strategy.
+  A critical section protects an invariant, not merely a line of code.
+  Keep unrelated work outside locks, but audit every shared variable.
+  volatile is not a thread synchronization mechanism.
+  Join after successful thread creation; check lifecycle and error paths.
+  Configure -> start -> wait -> use results is the transfer sequence.
+  count is transfers; total bytes = count * bytes per transfer.
+  Increment flags determine the address sequence.
+  Alignment, bounds, lifetime, and ownership are separate requirements.
+  Finishing an operation and reclaiming its resources are separate steps.
+  DMA overlaps work but still has setup, bandwidth, and completion costs.
+  The thread model teaches the interface, not real hardware performance.
+
+You should now be able to explain the intended behavior of both demos,
+identify the unsafe synchronization details in the current implementation,
+calculate the exact region a transfer descriptor touches, and describe
+when its destination is safe for the next consumer to use.
+
+
+SUPPLEMENTARY REFERENCES
+========================
+
+The local source files listed at the beginning are the primary references
+for all demo-specific behavior. For further reading and portability context:
+
+Apple: Addressing architectural differences in your macOS code
+  https://developer.apple.com/documentation/apple-silicon/addressing-architectural-differences-in-your-macos-code
+  See the shared-memory synchronization discussion and supported primitives
+  for the synchronization and portability topics in Sections 6-7.
+
+UCX project's first-hand macOS portability report
+  https://github.com/openucx/ucx/issues/333
+  Records the unavailable pthread_spinlock_t interface discussed in Section 7.
+
+POSIX pthread_join manual, reproduced by the Linux man-pages project
+  https://www.man7.org/linux/man-pages/man3/pthread_join.3p.html
+  Further reading for joining and thread-resource lifecycle in Sections 2
+  and 14. Consult the platform's own threading documentation when porting.
